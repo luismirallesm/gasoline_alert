@@ -87,8 +87,17 @@ def mercado():
 
 
 GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
-CONSULTA_GDELT = ('(oil OR crude OR OPEC OR Hormuz) '
-                  '(Iran OR Russia OR "Saudi Arabia" OR Israel OR Ukraine OR Libya OR Venezuela)')
+CONSULTA_GDELT = ('(oil OR crude OR OPEC OR Hormuz OR refinery) '
+                  '(Iran OR Russia OR "Saudi Arabia" OR Israel OR Ukraine OR Libya OR Venezuela) '
+                  'sourcelang:english')
+
+# Palabras en titulares: empujan el precio del crudo al alza o a la baja
+ALCISTAS = ["attack", "strike", "sanction", "outage", "disruption", "output cut", "production cut",
+            "cut output", "shortage", "embargo", "blockade", "closure", "explosion", "drone",
+            "escalat", "crunch", "tanker seized", "supply risk"]
+BAJISTAS = ["ceasefire", "peace", "truce", "raise output", "increase output", "output hike",
+            "glut", "surplus", "weak demand", "stockpile build", "reopen", "eases", "easing",
+            "talks resume", "deal reached", "sanctions relief"]
 
 
 def gdelt(params, intentos=3):
@@ -107,8 +116,10 @@ def gdelt(params, intentos=3):
 
 
 def geopolitica():
-    """Devuelve (z del tono de noticias, titulares). Tono muy negativo = tensión = riesgo de subida."""
-    tono_z, titulares = None, []
+    """Devuelve (tono_z, sesgo). Ninguno se muestra: solo ajustan la decisión.
+    tono_z: tono de las noticias de hoy vs. lo normal (muy negativo = tensión = riesgo de subida).
+    sesgo: -1..+1, balance de palabras alcistas/bajistas en titulares recientes."""
+    tono_z, sesgo = None, None
     js = gdelt({"query": CONSULTA_GDELT, "mode": "timelinetone", "format": "json", "timespan": "30d"})
     try:
         datos = js["timeline"][0]["data"]
@@ -120,16 +131,21 @@ def geopolitica():
         print("GDELT tono no utilizable:", repr(e))
     time.sleep(10)
     js = gdelt({"query": CONSULTA_GDELT, "mode": "artlist", "format": "json",
-                "maxrecords": 3, "timespan": "2d", "sort": "datedesc"})
+                "maxrecords": 75, "timespan": "2d", "sort": "datedesc"})
     try:
-        titulares = [a["title"] for a in js.get("articles", [])][:3]
+        titulos = [a["title"].lower() for a in js.get("articles", []) if a.get("title")]
+        if len(titulos) >= 10:
+            alza = sum(any(k in t for k in ALCISTAS) for t in titulos)
+            baja = sum(any(k in t for k in BAJISTAS) for t in titulos)
+            sesgo = (alza - baja) / len(titulos)
+        print(f"GDELT: tono_z={tono_z}, titulares={len(titulos)}, sesgo={sesgo}")
     except Exception as e:
         print("GDELT titulares no utilizables:", repr(e))
-    return tono_z, titulares
+    return tono_z, sesgo
 
 
 # ---------- Decisión ----------
-def decidir(mkt, tono_z):
+def decidir(mkt, tono_z, sesgo=None):
     r = mkt["rbob_eur_l"]
     if len(r) < 40:
         raise RuntimeError("Pocos datos de mercado")
@@ -139,7 +155,10 @@ def decidir(mkt, tono_z):
     hist = (r.rolling(3).mean() - r.shift(4).rolling(7).mean()).dropna()
     sigma = hist.std() * IVA * 100 * PASO      # lo "normal" que se mueve esto, en céntimos
     exp_cts = gap * IVA * 100 * PASO
-    ajuste_geo = 0.0 if tono_z is None else max(-1.0, min(1.0, -0.4 * tono_z))
+    # Las noticias solo empujan (máx. ±0,6 cts): por sí solas no activan un aviso (umbral 0,7)
+    ajuste_geo = 0.0 if tono_z is None else max(-0.4, min(0.4, -0.2 * tono_z))
+    if sesgo is not None:
+        ajuste_geo += max(-0.2, min(0.2, sesgo))
     exp_cts += ajuste_geo
     if exp_cts >= UMBRAL_SUBE:
         senal = "REPOSTA"
@@ -191,7 +210,7 @@ def acierto(df):
 
 
 # ---------- Mensaje ----------
-def mensaje(p, dec, titulares, ok, tot, tendencia, aviso_precios=None):
+def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None):
     emoji = {"REPOSTA": "🟢", "ESPERA": "🟡", "NEUTRO": "⚪"}[dec["senal"]]
     e = dec["exp_cts"]
     euros = abs(e) / 100 * LITROS
@@ -214,8 +233,6 @@ def mensaje(p, dec, titulares, ok, tot, tendencia, aviso_precios=None):
         t.append("Noticias: tensión geopolítica por encima de lo normal (sesgo al alza)")
     elif dec["ajuste_geo"] < -0.2:
         t.append("Noticias: tono más calmado de lo normal (sesgo a la baja)")
-    if titulares:
-        t += ["", "📰 " + "\n📰 ".join(html.escape(x) for x in titulares)]
     t.append("")
     if tot >= 10:
         t.append(f"Acierto real hasta ahora: {ok / tot:.0%} ({ok}/{tot} avisos comprobados)")
@@ -248,8 +265,8 @@ def main():
         except Exception as e:  # sin precios aún se puede avisar con el mercado
             p, aviso = None, e
         mkt = paso("Mercado (Yahoo Finance)", mercado)
-        tono_z, titulares = geopolitica()
-        dec = decidir(mkt, tono_z)
+        tono_z, sesgo = geopolitica()
+        dec = decidir(mkt, tono_z, sesgo)
         df = cargar()
         tendencia = None
         if p:
@@ -264,7 +281,7 @@ def main():
             hace7 = d[d["fecha"] <= pd.Timestamp(hoy) - pd.Timedelta(days=7)]
             tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
         ok, tot = acierto(df) if len(df) else (0, 0)
-        enviar(mensaje(p, dec, titulares, ok, tot, tendencia, aviso))
+        enviar(mensaje(p, dec, ok, tot, tendencia, aviso))
     except Exception as e:
         try:
             enviar(f"⚠️ El bot de gasolina falló hoy: {html.escape(str(e))}")
