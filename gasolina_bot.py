@@ -35,14 +35,33 @@ COLUMNAS = ["fecha", "media", "mediana", "minimo", "n", "senal", "exp_cts", "ton
 
 
 # ---------- Datos ----------
+CABECERAS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9",
+}
+
+
+def descargar(url, intentos=5):
+    """GET con reintentos. La web del Ministerio a veces corta la conexión o tiene mal el certificado."""
+    import urllib3
+    urllib3.disable_warnings()
+    ultimo = None
+    for i in range(intentos):
+        try:
+            r = requests.get(url, headers=CABECERAS, timeout=90, verify=(i < 2))
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            ultimo = e
+            print(f"Intento {i + 1}/{intentos} fallido: {e}")
+            time.sleep(5 * (i + 1))
+    raise ultimo
+
+
 def precios_provincia():
-    h = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(URL_MINETUR, headers=h, timeout=60)
-    except requests.exceptions.SSLError:
-        # La web del Ministerio a veces tiene mal la cadena de certificados. Son datos públicos.
-        r = requests.get(URL_MINETUR, headers=h, timeout=60, verify=False)
-    r.raise_for_status()
+    r = descargar(URL_MINETUR)
     estaciones = json.loads(r.content.decode("utf-8-sig"))["ListaEESSPrecio"]
     valores = []
     for e in estaciones:
@@ -157,7 +176,7 @@ def acierto(df):
 
 
 # ---------- Mensaje ----------
-def mensaje(p, dec, titulares, ok, tot, tendencia):
+def mensaje(p, dec, titulares, ok, tot, tendencia, aviso_precios=None):
     emoji = {"REPOSTA": "🟢", "ESPERA": "🟡", "NEUTRO": "⚪"}[dec["senal"]]
     e = dec["exp_cts"]
     euros = abs(e) / 100 * LITROS
@@ -168,7 +187,9 @@ def mensaje(p, dec, titulares, ok, tot, tendencia):
     else:
         titulo = "DA IGUAL: no se espera un cambio relevante, reposta cuando te toque"
     t = [f"⛽ <b>Gasolina 95 · Provincia de Alicante</b>",
-         f"Hoy: media {p['media']:.3f} €/L · mínimo {p['minimo']:.3f} ({p['n']} gasolineras)",
+         (f"Hoy: media {p['media']:.3f} €/L · mínimo {p['minimo']:.3f} ({p['n']} gasolineras)"
+          if p else f"⚠️ No pude leer los precios del surtidor hoy ({html.escape(str(aviso_precios))}). "
+                    "El aviso se basa solo en el mercado mayorista."),
          "", f"{emoji} <b>{titulo}</b>", f"Confianza: {dec['conf']}", "",
          f"Mayorista (gasolina) últimos 3 días vs. lo que ya refleja el surtidor: {dec['cambio_may']:+.1f}%",
          f"Brent en 5 días: {dec['brent_7d']:+.1f}%"]
@@ -198,25 +219,37 @@ def enviar(texto):
     r.raise_for_status()
 
 
+def paso(nombre, fn):
+    try:
+        return fn()
+    except Exception as e:
+        raise RuntimeError(f"{nombre}: {e}") from e
+
+
 def main():
     try:
-        p = precios_provincia()
-        mkt = mercado()
+        try:
+            p, aviso = paso("Precios del Ministerio", precios_provincia), None
+        except Exception as e:  # sin precios aún se puede avisar con el mercado
+            p, aviso = None, e
+        mkt = paso("Mercado (Yahoo Finance)", mercado)
         tono_z, titulares = geopolitica()
         dec = decidir(mkt, tono_z)
         df = cargar()
-        hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
-        guardar(df, {"fecha": hoy, "media": round(p["media"], 4), "mediana": round(p["mediana"], 4),
-                     "minimo": p["minimo"], "n": p["n"], "senal": dec["senal"],
-                     "exp_cts": round(dec["exp_cts"], 2),
-                     "tono_z": None if tono_z is None else round(tono_z, 2)})
-        df = cargar()
-        ok, tot = acierto(df)
-        d = df.copy()
-        d["fecha"] = pd.to_datetime(d["fecha"])
-        hace7 = d[d["fecha"] <= pd.Timestamp(hoy) - pd.Timedelta(days=7)]
-        tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
-        enviar(mensaje(p, dec, titulares, ok, tot, tendencia))
+        tendencia = None
+        if p:
+            hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
+            guardar(df, {"fecha": hoy, "media": round(p["media"], 4),
+                         "mediana": round(p["mediana"], 4), "minimo": p["minimo"], "n": p["n"],
+                         "senal": dec["senal"], "exp_cts": round(dec["exp_cts"], 2),
+                         "tono_z": None if tono_z is None else round(tono_z, 2)})
+            df = cargar()
+            d = df.copy()
+            d["fecha"] = pd.to_datetime(d["fecha"])
+            hace7 = d[d["fecha"] <= pd.Timestamp(hoy) - pd.Timedelta(days=7)]
+            tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
+        ok, tot = acierto(df) if len(df) else (0, 0)
+        enviar(mensaje(p, dec, titulares, ok, tot, tendencia, aviso))
     except Exception as e:
         try:
             enviar(f"⚠️ El bot de gasolina falló hoy: {html.escape(str(e))}")
