@@ -86,30 +86,45 @@ def mercado():
     return d
 
 
+GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
+CONSULTA_GDELT = ('(oil OR crude OR OPEC OR Hormuz) '
+                  '(Iran OR Russia OR "Saudi Arabia" OR Israel OR Ukraine OR Libya OR Venezuela)')
+
+
+def gdelt(params, intentos=3):
+    """Petición a GDELT con reintentos. Si falla, imprime qué respondió realmente (para diagnosticar)."""
+    for i in range(intentos):
+        r = None
+        try:
+            r = requests.get(GDELT, params=params, headers=CABECERAS, timeout=60)
+            return r.json()
+        except Exception as e:
+            estado = r.status_code if r is not None else None
+            cuerpo = r.text[:300] if r is not None else ""
+            print(f"GDELT intento {i + 1}/{intentos}: {e} | estado={estado} | respuesta={cuerpo!r}")
+            time.sleep(10)  # GDELT pide ~1 petición cada 5 s
+    return None
+
+
 def geopolitica():
     """Devuelve (z del tono de noticias, titulares). Tono muy negativo = tensión = riesgo de subida."""
-    base = "https://api.gdeltproject.org/api/v2/doc/doc"
-    q = ('(oil OR crude OR OPEC OR Hormuz) '
-         '(Iran OR Russia OR "Saudi Arabia" OR Israel OR Ukraine OR Libya OR Venezuela)')
     tono_z, titulares = None, []
+    js = gdelt({"query": CONSULTA_GDELT, "mode": "timelinetone", "format": "json", "timespan": "30d"})
     try:
-        r = requests.get(base, params={"query": q, "mode": "timelinetone",
-                                       "format": "json", "timespan": "30d"}, timeout=60)
-        datos = r.json()["timeline"][0]["data"]
+        datos = js["timeline"][0]["data"]
         idx = pd.to_datetime([p["date"] for p in datos], format="%Y%m%dT%H%M%SZ")
         s = pd.Series([p["value"] for p in datos], index=idx).resample("D").mean().dropna()
         if len(s) >= 10 and s.std() > 0:
             tono_z = float((s.iloc[-3:].mean() - s.mean()) / s.std())
     except Exception as e:
-        print("GDELT tono no disponible:", e)
-    time.sleep(6)  # GDELT pide ~1 petición cada 5 s
+        print("GDELT tono no utilizable:", repr(e))
+    time.sleep(10)
+    js = gdelt({"query": CONSULTA_GDELT, "mode": "artlist", "format": "json",
+                "maxrecords": 3, "timespan": "2d", "sort": "datedesc"})
     try:
-        r = requests.get(base, params={"query": q, "mode": "artlist", "format": "json",
-                                       "maxrecords": 3, "timespan": "2d", "sort": "datedesc"},
-                         timeout=60)
-        titulares = [a["title"] for a in r.json().get("articles", [])][:3]
+        titulares = [a["title"] for a in js.get("articles", [])][:3]
     except Exception as e:
-        print("GDELT titulares no disponibles:", e)
+        print("GDELT titulares no utilizables:", repr(e))
     return tono_z, titulares
 
 
