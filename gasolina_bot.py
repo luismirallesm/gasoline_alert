@@ -43,20 +43,39 @@ CABECERAS = {
 }
 
 
-def descargar(url, intentos=5):
-    """GET con reintentos. La web del Ministerio a veces corta la conexión o tiene mal el certificado."""
+class AdaptadorTLS(requests.adapters.HTTPAdapter):
+    """TLS permisivo: algunos servidores públicos cortan la conexión con los cifrados modernos."""
+
+    def init_poolmanager(self, *a, **k):
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        k["ssl_context"] = ctx
+        return super().init_poolmanager(*a, **k)
+
+
+def descargar(url, intentos=6):
+    """GET con reintentos, alternando conexión normal y permisiva. El Ministerio corta a veces."""
     import urllib3
     urllib3.disable_warnings()
     ultimo = None
     for i in range(intentos):
         try:
-            r = requests.get(url, headers=CABECERAS, timeout=90, verify=(i < 2))
+            if i % 2 == 0:
+                r = requests.get(url, headers=CABECERAS, timeout=90, verify=(i == 0))
+            else:
+                ses = requests.Session()
+                ses.mount("https://", AdaptadorTLS())
+                r = ses.get(url, headers=CABECERAS, timeout=90, verify=False)
             r.raise_for_status()
             return r
         except requests.exceptions.RequestException as e:
             ultimo = e
             print(f"Intento {i + 1}/{intentos} fallido: {e}")
-            time.sleep(5 * (i + 1))
+            if i < intentos - 1:
+                time.sleep(5 * (i + 1))
     raise ultimo
 
 
@@ -210,7 +229,7 @@ def acierto(df):
 
 
 # ---------- Mensaje ----------
-def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None):
+def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None, manana=None):
     emoji = {"REPOSTA": "🟢", "ESPERA": "🟡", "NEUTRO": "⚪"}[dec["senal"]]
     e = dec["exp_cts"]
     euros = abs(e) / 100 * LITROS
@@ -227,6 +246,13 @@ def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None):
          "", f"{emoji} <b>{titulo}</b>", f"Confianza: {dec['conf']}", "",
          f"Mayorista (gasolina) últimos 3 días vs. lo que ya refleja el surtidor: {dec['cambio_may']:+.1f}%",
          f"Brent en 5 días: {dec['brent_7d']:+.1f}%"]
+    if manana is not None:
+        antes = f"{manana['media']:.3f} €/L, aviso de la mañana: {manana['senal']}"
+        if p:
+            dif = (p["media"] - manana["media"]) * 100
+            t.insert(2, f"🔄 Desde esta mañana ({antes}): {dif:+.1f} cts/L en la media")
+        else:
+            t.insert(2, f"🔄 Esta mañana: {antes}")
     if tendencia is not None:
         t.append(f"Surtidor en la última semana: {tendencia:+.1f} cts/L")
     if dec["ajuste_geo"] > 0.2:
@@ -259,30 +285,46 @@ def paso(nombre, fn):
 
 
 def main():
+    # El workflow lanza varios intentos al día. Solo el último (o una ejecución manual)
+    # avisa si no hay forma de leer los precios; los anteriores fallan en silencio y reintentan.
+    ultimo = os.environ.get("ULTIMO_INTENTO", "true").lower() == "true"
+    peticion = os.environ.get("PETICION", "false").lower() == "true"  # lanzado a mano o desde Telegram
+    hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
+    df = cargar()
+    fila_hoy = df[df["fecha"] == hoy]
+    manana = fila_hoy.iloc[0] if (peticion and not fila_hoy.empty) else None
+    if not ultimo and (df["fecha"] == hoy).any():
+        print("Ya se envió el aviso de hoy; nada que hacer.")
+        return
     try:
         try:
             p, aviso = paso("Precios del Ministerio", precios_provincia), None
-        except Exception as e:  # sin precios aún se puede avisar con el mercado
-            p, aviso = None, e
+        except Exception as e:
+            if not ultimo:
+                print(f"{e}. Se reintentará en la próxima ejecución del día.")
+                return
+            p, aviso = None, e  # último intento: se avisa solo con el mercado
         mkt = paso("Mercado (Yahoo Finance)", mercado)
         tono_z, sesgo = geopolitica()
         dec = decidir(mkt, tono_z, sesgo)
-        df = cargar()
         tendencia = None
         if p:
-            hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
-            guardar(df, {"fecha": hoy, "media": round(p["media"], 4),
-                         "mediana": round(p["mediana"], 4), "minimo": p["minimo"], "n": p["n"],
-                         "senal": dec["senal"], "exp_cts": round(dec["exp_cts"], 2),
-                         "tono_z": None if tono_z is None else round(tono_z, 2)})
-            df = cargar()
+            if manana is None:  # una consulta a petición no pisa el dato de la mañana
+                guardar(df, {"fecha": hoy, "media": round(p["media"], 4),
+                             "mediana": round(p["mediana"], 4), "minimo": p["minimo"], "n": p["n"],
+                             "senal": dec["senal"], "exp_cts": round(dec["exp_cts"], 2),
+                             "tono_z": None if tono_z is None else round(tono_z, 2)})
+                df = cargar()
             d = df.copy()
             d["fecha"] = pd.to_datetime(d["fecha"])
             hace7 = d[d["fecha"] <= pd.Timestamp(hoy) - pd.Timedelta(days=7)]
             tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
         ok, tot = acierto(df) if len(df) else (0, 0)
-        enviar(mensaje(p, dec, ok, tot, tendencia, aviso))
+        enviar(mensaje(p, dec, ok, tot, tendencia, aviso, manana))
     except Exception as e:
+        if not ultimo:
+            print(f"Error: {e}. Se reintentará en la próxima ejecución del día.")
+            return
         try:
             enviar(f"⚠️ El bot de gasolina falló hoy: {html.escape(str(e))}")
         finally:
