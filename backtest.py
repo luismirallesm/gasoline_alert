@@ -177,7 +177,17 @@ def analizar(hist, mkt):
     cal = pd.date_range(h.index.min(), h.index.max(), freq="D")
     P = h["media"].reindex(cal).interpolate(limit=3).dropna()
     cal = P.index
-    r = mkt["rbob_eur_l"]
+    r = mkt["rbob_eur_l"].copy()
+    idx = pd.DatetimeIndex(r.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    r.index = idx.normalize()
+    r = r[~r.index.duplicated()].sort_index()
+    print(f"Mercado: {len(r)} días, de {r.index.min().date()} a {r.index.max().date()}; "
+          f"precios surtidor: de {cal[0].date()} a {cal[-1].date()}")
+    if len(r) < 200 or r.index.min() > cal[0] + pd.Timedelta(days=14):
+        raise RuntimeError(f"Datos de mercado insuficientes: {len(r)} días desde {r.index.min().date()}; "
+                           f"hacen falta desde {cal[0].date()}")
     Pa = P.values
     n = len(Pa) - VENTANA
     corte = int(0.65 * n)
@@ -188,6 +198,9 @@ def analizar(hist, mkt):
 
     # Ajuste actual del bot
     sig0, e0 = senal_para(3, 4, gb.UMBRAL_SUBE, gb.UMBRAL_BAJA)
+    if np.nanstd(e0) == 0:
+        raise RuntimeError("Las señales del modelo son constantes: las fechas de mercado y de "
+                           "precios no se alinean. Resultado descartado.")
     a_hoy, a_azar, opt, p_espera = simular(Pa, sig0)
     # Calibración: ¿el precio de surtidor se mueve lo que el modelo predice?
     fut = np.array([(Pa[i + 7] - Pa[i]) * 100 if i + 7 < len(Pa) else np.nan for i in range(len(Pa))])
@@ -221,6 +234,7 @@ def analizar(hist, mkt):
     L.append("# Backtest del bot de gasolina 95 · provincia de Alicante\n")
     L.append(f"Datos: {cobertura} días de precios del Ministerio ({cal[0].date()} a {cal[-1].date()}), "
              f"{int(h['n'].min())}-{int(h['n'].max())} gasolineras por día.")
+    L.append(f"Mercado: {len(r)} días de gasolina mayorista ({r.index.min().date()} a {r.index.max().date()}).")
     L.append("Sin noticias (no hay histórico gratuito largo): se prueba solo el modelo de mercado.")
     L.append(f"Conductor simulado: necesita repostar en los próximos {VENTANA} días. "
              f"Ahorro en céntimos por litro (≈ ×{gb.LITROS / 100:.2f} € por depósito de {gb.LITROS} L).\n")
@@ -264,7 +278,7 @@ def analizar(hist, mkt):
 def main():
     try:
         hist = descargar_historico(date.today())
-        mkt = gb.mercado("3y")
+        mkt = gb.mercado("2y")
         texto, resumen = analizar(hist, mkt)
         INFORME.parent.mkdir(exist_ok=True)
         INFORME.write_text(texto, encoding="utf-8")
