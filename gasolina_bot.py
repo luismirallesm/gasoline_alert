@@ -95,10 +95,10 @@ def precios_provincia():
     return {"media": s.mean(), "mediana": s.median(), "minimo": s.min(), "n": len(s)}
 
 
-def mercado():
+def mercado(periodo="1y"):
     import yfinance as yf
 
-    d = yf.download(["RB=F", "BZ=F", "EURUSD=X"], period="1y", interval="1d",
+    d = yf.download(["RB=F", "BZ=F", "EURUSD=X"], period=periodo, interval="1d",
                     auto_adjust=True, progress=False)["Close"].dropna()
     d["rbob_eur_l"] = d["RB=F"] / 3.78541 / d["EURUSD=X"]   # USD/galón -> EUR/litro
     d["brent_eur"] = d["BZ=F"] / d["EURUSD=X"]
