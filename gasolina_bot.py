@@ -29,8 +29,11 @@ CSV = Path("data/precios_alicante.csv")
 LITROS = 40          # tamaño de un repostaje típico
 IVA = 1.21
 PASO = 0.8           # fracción del cambio mayorista que acaba llegando al surtidor
-UMBRAL_SUBE = 0.7    # céntimos/L: por encima -> REPOSTA
-UMBRAL_BAJA = -1.0   # céntimos/L: por debajo -> ESPERA (el surtidor baja lento, exige más)
+FUERTE = 1.5         # el movimiento del mayorista supera 1,5 veces lo normal -> aviso REPOSTA/ESPERA
+SUAVE = 0.75         # entre 0,75 y 1,5: solo se comenta la tendencia (DA IGUAL)
+# Umbrales en céntimos del modelo antiguo: ya no se usan en el aviso, backtest.py los sigue usando
+UMBRAL_SUBE = 0.7
+UMBRAL_BAJA = -1.0
 COLUMNAS = ["fecha", "media", "mediana", "minimo", "n", "senal", "exp_cts", "tono_z"]
 
 
@@ -174,23 +177,24 @@ def decidir(mkt, tono_z, sesgo=None):
     hist = (r.rolling(3).mean() - r.shift(4).rolling(7).mean()).dropna()
     sigma = hist.std() * IVA * 100 * PASO      # lo "normal" que se mueve esto, en céntimos
     exp_cts = gap * IVA * 100 * PASO
-    # Las noticias solo empujan (máx. ±0,6 cts): por sí solas no activan un aviso (umbral 0,7)
+    # Las noticias solo empujan (máx. ±0,6 cts): por sí solas no activan un aviso
     ajuste_geo = 0.0 if tono_z is None else max(-0.4, min(0.4, -0.2 * tono_z))
     if sesgo is not None:
         ajuste_geo += max(-0.2, min(0.2, sesgo))
     exp_cts += ajuste_geo
-    if exp_cts >= UMBRAL_SUBE:
+    z = exp_cts / sigma if sigma > 0 else 0.0   # cuántas veces lo normal se ha movido el mayorista
+    if z >= FUERTE:
         senal = "REPOSTA"
-    elif exp_cts <= UMBRAL_BAJA:
+    elif z <= -FUERTE:
         senal = "ESPERA"
     else:
         senal = "NEUTRO"
-    fuerza = abs(exp_cts) / sigma if sigma > 0 else 0
-    conf = "alta" if fuerza >= 1.5 else "media" if fuerza >= 0.75 else "baja"
+    tendencia_mercado = "alza" if z >= SUAVE else "baja" if z <= -SUAVE else "estable"
+    conf = "alta" if abs(z) >= FUERTE else "media" if abs(z) >= SUAVE else "baja"
     cambio_may = (nuevo / reflejado - 1) * 100
     brent_7d = (mkt["brent_eur"].iloc[-1] / mkt["brent_eur"].iloc[-6] - 1) * 100
-    return {"senal": senal, "exp_cts": exp_cts, "conf": conf, "cambio_may": cambio_may,
-            "brent_7d": brent_7d, "ajuste_geo": ajuste_geo}
+    return {"senal": senal, "exp_cts": exp_cts, "z": z, "conf": conf, "mercado": tendencia_mercado,
+            "cambio_may": cambio_may, "brent_7d": brent_7d, "ajuste_geo": ajuste_geo}
 
 
 # ---------- Histórico y acierto ----------
@@ -229,25 +233,30 @@ def acierto(df):
 
 
 # ---------- Mensaje ----------
+PALABRA = {"REPOSTA": "reposta", "ESPERA": "espera", "NEUTRO": "da igual"}
+
+
 def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None, manana=None):
     emoji = {"REPOSTA": "🟢", "ESPERA": "🟡", "NEUTRO": "⚪"}[dec["senal"]]
-    e = dec["exp_cts"]
-    euros = abs(e) / 100 * LITROS
     if dec["senal"] == "REPOSTA":
-        titulo = f"REPOSTA HOY: se espera subida de ~{e:.1f} cts/L (≈{euros:.2f} € en {LITROS} L)"
+        titulo = "REPOSTA HOY: el mercado ha subido con fuerza y el surtidor aún no lo ha reflejado"
     elif dec["senal"] == "ESPERA":
-        titulo = f"ESPERA unos días: se espera bajada de ~{abs(e):.1f} cts/L (≈{euros:.2f} € en {LITROS} L)"
+        titulo = "ESPERA unos días: el mercado ha bajado con fuerza y el surtidor aún no lo ha reflejado"
+    elif dec["mercado"] == "alza":
+        titulo = "DA IGUAL: el mercado apunta algo al alza, pero sin señal fuerte"
+    elif dec["mercado"] == "baja":
+        titulo = "DA IGUAL: el mercado apunta algo a la baja, pero sin señal fuerte"
     else:
-        titulo = "DA IGUAL: no se espera un cambio relevante, reposta cuando te toque"
-    t = [f"⛽ <b>Gasolina 95 · Provincia de Alicante</b>",
+        titulo = "DA IGUAL: mercado estable, reposta cuando te toque"
+    t = ["⛽ <b>Gasolina 95 · Provincia de Alicante</b>",
          (f"Hoy: media {p['media']:.3f} €/L · mínimo {p['minimo']:.3f} ({p['n']} gasolineras)"
           if p else f"⚠️ No pude leer los precios del surtidor hoy ({html.escape(str(aviso_precios))}). "
                     "El aviso se basa solo en el mercado mayorista."),
-         "", f"{emoji} <b>{titulo}</b>", f"Confianza: {dec['conf']}", "",
-         f"Mayorista (gasolina) últimos 3 días vs. lo que ya refleja el surtidor: {dec['cambio_may']:+.1f}%",
+         "", f"{emoji} <b>{titulo}</b>", "",
+         f"Gasolina mayorista (3 días) vs. lo que ya refleja el surtidor: {dec['cambio_may']:+.1f}%",
          f"Brent en 5 días: {dec['brent_7d']:+.1f}%"]
     if manana is not None:
-        antes = f"{manana['media']:.3f} €/L, aviso de la mañana: {manana['senal']}"
+        antes = f"{manana['media']:.3f} €/L, aviso de la mañana: {PALABRA.get(manana['senal'], manana['senal'])}"
         if p:
             dif = (p["media"] - manana["media"]) * 100
             t.insert(2, f"🔄 Desde esta mañana ({antes}): {dif:+.1f} cts/L en la media")
@@ -256,14 +265,12 @@ def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None, manana=None):
     if tendencia is not None:
         t.append(f"Surtidor en la última semana: {tendencia:+.1f} cts/L")
     if dec["ajuste_geo"] > 0.2:
-        t.append("Noticias: tensión geopolítica por encima de lo normal (sesgo al alza)")
+        t.append("Noticias: tensión geopolítica por encima de lo normal")
     elif dec["ajuste_geo"] < -0.2:
-        t.append("Noticias: tono más calmado de lo normal (sesgo a la baja)")
-    t.append("")
+        t.append("Noticias: tono más calmado de lo normal")
+    t += ["", "Orientativo: el mercado explica solo una parte pequeña del precio del surtidor."]
     if tot >= 10:
-        t.append(f"Acierto real hasta ahora: {ok / tot:.0%} ({ok}/{tot} avisos comprobados)")
-    else:
-        t.append(f"Acierto real: aún pocos datos ({tot} avisos comprobados, hacen falta 10)")
+        t.append(f"Acierto real de los avisos: {ok / tot:.0%} ({ok}/{tot} comprobados)")
     return "\n".join(t)
 
 
