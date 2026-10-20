@@ -14,6 +14,7 @@ import html
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +27,8 @@ URL_MINETUR = (
     f"PreciosCarburantes/EstacionesTerrestres/FiltroProvincia/{PROVINCIA}"
 )
 CSV = Path("data/precios_alicante.csv")
+HIST_MIN = Path("data/historico_ministerio.csv")   # lo crea backtest.py
+WEB = Path("docs/datos.json")                       # lo lee docs/index.html
 LITROS = 40          # tamaño de un repostaje típico
 IVA = 1.21
 PASO = 0.8           # fracción del cambio mayorista que acaba llegando al surtidor
@@ -274,6 +277,41 @@ def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None, manana=None):
     return "\n".join(t)
 
 
+def publicar_web(p, dec, tendencia, dias=120):
+    """Escribe docs/datos.json: lo que muestra la web pública (GitHub Pages)."""
+    partes = []
+    if HIST_MIN.exists():
+        partes.append(pd.read_csv(HIST_MIN)[["fecha", "media", "minimo"]])
+    propio = cargar()
+    if len(propio):
+        partes.append(propio[["fecha", "media", "minimo", "senal"]])
+    hist = []
+    if partes:
+        df = pd.concat(partes, ignore_index=True).drop_duplicates("fecha", keep="last")
+        df["media"] = pd.to_numeric(df["media"], errors="coerce")
+        df["minimo"] = pd.to_numeric(df["minimo"], errors="coerce")
+        df = df.dropna(subset=["media"]).sort_values("fecha").tail(dias)
+        if "senal" not in df:
+            df["senal"] = None
+        for _, f in df.iterrows():
+            hist.append({"fecha": f["fecha"], "media": round(float(f["media"]), 3),
+                         "minimo": None if pd.isna(f["minimo"]) else round(float(f["minimo"]), 3),
+                         "senal": f["senal"] if isinstance(f["senal"], str) else None})
+    g = dec["ajuste_geo"]
+    datos = {
+        "actualizado": datetime.now(timezone.utc).isoformat(timespec="minutes"),
+        "zona": "provincia de Alicante", "combustible": "Gasolina 95",
+        "precio": {"media": round(p["media"], 3), "minimo": round(float(p["minimo"]), 3), "n": int(p["n"])},
+        "senal": dec["senal"], "mercado": dec["mercado"], "z": round(float(dec["z"]), 2),
+        "mayorista_pct": round(float(dec["cambio_may"]), 1), "brent_pct": round(float(dec["brent_7d"]), 1),
+        "noticias": "tension" if g > 0.2 else "calma" if g < -0.2 else "normal",
+        "semana_cts": None if tendencia is None else round(float(tendencia), 1),
+        "historico": hist,
+    }
+    WEB.parent.mkdir(exist_ok=True)
+    WEB.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+
+
 def enviar(texto):
     token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
@@ -326,6 +364,11 @@ def main():
             d["fecha"] = pd.to_datetime(d["fecha"])
             hace7 = d[d["fecha"] <= pd.Timestamp(hoy) - pd.Timedelta(days=7)]
             tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
+        if p:
+            try:
+                publicar_web(p, dec, tendencia)
+            except Exception as e:
+                print("No se pudo actualizar la web:", repr(e))
         ok, tot = acierto(df) if len(df) else (0, 0)
         enviar(mensaje(p, dec, ok, tot, tendencia, aviso, manana))
     except Exception as e:
