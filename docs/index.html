@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gasolina 95 en Alicante: ¿repostar hoy o esperar?</title>
-<meta name="description" content="Aviso diario gratuito: precio medio de la gasolina 95 en la provincia de Alicante y si conviene repostar hoy o esperar unos días.">
+<title>Gasolina y diésel en Alicante: ¿repostar hoy o esperar?</title>
+<meta name="description" content="Aviso diario gratuito: precio medio de la gasolina 95 y del diésel en la provincia de Alicante, y si conviene repostar hoy o esperar unos días.">
 <meta name="theme-color" content="#eef3f2" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d1a1c" media="(prefers-color-scheme: dark)">
 <style>
@@ -63,6 +63,17 @@ section.veredicto { margin-top: 1.4rem; }
   margin: 1rem 0 0; padding: 0.7rem 0.9rem; font-size: 0.92rem;
   background: var(--wait-tint); color: var(--ink); border-left: 4px solid var(--wait);
 }
+
+/* Selector de combustible */
+.selector { display: inline-flex; margin-top: 1rem; border: 1.5px solid var(--ink); border-radius: 0.5rem; overflow: hidden; }
+.selector button {
+  font: inherit; font-weight: 600; padding: 0.5rem 1.1rem; border: 0; cursor: pointer;
+  background: transparent; color: var(--ink);
+}
+.selector button + button { border-left: 1.5px solid var(--ink); }
+.selector button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.selector button:focus-visible { outline-offset: -3px; }
+.nota-metodo { margin: 1rem 0 0; padding: 0.6rem 0.8rem; font-size: 0.92rem; background: var(--calm-tint); border-left: 4px solid var(--sea); max-width: 34rem; }
 
 /* Veredicto: es lo primero que se lee, y el medidor muestra cuánta fuerza tiene la señal */
 h1#titulo {
@@ -145,6 +156,7 @@ footer p { max-width: none; }
   <header>
     <p class="zona" id="zona">Gasolina 95 en la provincia de Alicante</p>
     <p class="actualizado" id="actualizado" aria-live="polite"></p>
+    <div class="selector" id="selector" role="group" aria-label="Combustible" hidden></div>
   </header>
 
   <div id="estado" class="estado" role="status">Cargando el aviso de hoy…</div>
@@ -155,6 +167,7 @@ footer p { max-width: none; }
     <section class="veredicto" aria-labelledby="titulo">
       <h1 id="titulo"></h1>
       <p class="motivo" id="motivo"></p>
+      <p class="nota-metodo" id="nota" hidden></p>
       <div class="medidor" aria-hidden="true">
         <div class="barra">
           <span class="z-espera"></span><span class="z-igual"></span><span class="z-reposta"></span>
@@ -188,8 +201,8 @@ footer p { max-width: none; }
 
     <section aria-labelledby="h-leer">
       <h2 id="h-leer">Cómo leerlo</h2>
-      <p>Cuando se mueve el precio de la gasolina en el mercado mayorista, las gasolineras tardan unos días en seguirlo. El aviso compara las dos cosas: si el mercado ya subió y el surtidor todavía no, conviene repostar antes de que suba; si ya bajó, esperar un poco puede compensar.</p>
-      <p>Es una orientación, no una predicción. El mercado explica solo una parte pequeña de lo que cuesta la gasolina en el surtidor, así que casi todos los días el aviso será «da igual». Elegir una gasolinera barata ahorra mucho más que elegir el día.</p>
+      <p>Cuando se mueve el precio del combustible en el mercado mayorista, las gasolineras tardan unos días en seguirlo. El aviso compara las dos cosas: si el mercado ya subió y el surtidor todavía no, conviene repostar antes de que suba; si ya bajó, esperar un poco puede compensar.</p>
+      <p>Es una orientación, no una predicción. El mercado explica solo una parte pequeña de lo que cuesta repostar, así que casi todos los días el aviso será «da igual». Elegir una gasolinera barata ahorra mucho más que elegir el día.</p>
     </section>
   </div>
 
@@ -237,8 +250,12 @@ footer p { max-width: none; }
     return t;
   }
 
-  function pintarCabecera(d) {
-    $("zona").textContent = d.combustible + " en la " + d.zona;
+  var DATOS = null, ACTUAL = "gasolina";
+  var NOMBRES = { gasolina: "Gasolina 95", diesel: "Diésel" };
+  var MAYORISTA = { gasolina: "Gasolina", diesel: "Gasóleo" };
+
+  function pintarCabecera(d, c) {
+    $("zona").textContent = (c.nombre || NOMBRES[ACTUAL]) + " en la " + d.zona;
     var act = new Date(d.actualizado);
     if (isNaN(act)) return;
     var horas = (Date.now() - act.getTime()) / 36e5;
@@ -288,7 +305,7 @@ footer p { max-width: none; }
     ul.textContent = "";
     function li(html) { var e = document.createElement("li"); e.innerHTML = html; ul.appendChild(e); }
     var may = d.mayorista_pct;
-    li("Gasolina mayorista, últimos 3 días, frente a lo que ya refleja el surtidor: <strong>" + dec1.format(may) + " %</strong>");
+    li((d.mayorista || MAYORISTA[ACTUAL]) + " mayorista, últimos 3 días, frente a lo que ya refleja el surtidor: <strong>" + dec1.format(may) + " %</strong>");
     li("Petróleo Brent en los últimos 5 días: <strong>" + dec1.format(d.brent_pct) + " %</strong>");
     var n = { tension: "tensión geopolítica por encima de lo normal", calma: "tono más calmado de lo normal", normal: "sin novedades fuera de lo normal" }[d.noticias] || "sin novedades fuera de lo normal";
     li("Noticias sobre petróleo: " + n);
@@ -296,6 +313,7 @@ footer p { max-width: none; }
 
   function pintarGrafico(d) {
     var cont = $("grafico");
+    $("leyenda").hidden = false;
     var h = (d.historico || []).filter(function (r) { return typeof r.media === "number"; }).slice(-90);
     if (h.length < 3) {
       cont.innerHTML = '<p class="nota">Todavía no hay suficiente histórico para dibujar el gráfico.</p>';
@@ -315,7 +333,7 @@ footer p { max-width: none; }
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.setAttribute("role", "img");
     svg.setAttribute("tabindex", "0");
-    svg.setAttribute("aria-label", "Gráfico del precio medio de la gasolina 95 entre el " + corto.format(fechaLocal(h[0].fecha)) +
+    svg.setAttribute("aria-label", "Gráfico del precio medio de " + (d.nombre || NOMBRES[ACTUAL]).toLowerCase() + " entre el " + corto.format(fechaLocal(h[0].fecha)) +
       " y el " + corto.format(fechaLocal(h[h.length - 1].fecha)) + ". Empieza en " + eur.format(h[0].media) +
       " euros por litro y termina en " + eur.format(h[h.length - 1].media) + ".");
     function el(name, attrs, parent) {
@@ -375,14 +393,55 @@ footer p { max-width: none; }
     svg.addEventListener("pointerleave", ocultar);
   }
 
+  function pintarCombustible() {
+    var c = DATOS.combustibles[ACTUAL];
+    document.title = (c.senal === "REPOSTA" ? "Reposta hoy" : c.senal === "ESPERA" ? "Espera unos días" : "Da igual") +
+      ": " + (c.nombre || NOMBRES[ACTUAL]).toLowerCase() + " en Alicante";
+    pintarCabecera(DATOS, c);
+    pintarVeredicto(c);
+    var nota = $("nota");
+    nota.hidden = !c.nota;
+    nota.textContent = c.nota || "";
+    pintarPrecios(c);
+    pintarGrafico(c);
+    pintarMira(c);
+    var botones = $("selector").querySelectorAll("button");
+    for (var i = 0; i < botones.length; i++) botones[i].setAttribute("aria-pressed", botones[i].dataset.clave === ACTUAL ? "true" : "false");
+  }
+
+  function elegir(clave) {
+    if (!DATOS.combustibles[clave]) return;
+    ACTUAL = clave;
+    try { localStorage.setItem("combustible", clave); } catch (e) {}
+    try { history.replaceState(null, "", "#" + clave); } catch (e) {}
+    pintarCombustible();
+  }
+
   function pintar(d) {
-    if (!d || !d.precio || typeof d.precio.media !== "number") { fallo("El archivo de datos no tiene el formato esperado."); return; }
-    document.title = (d.senal === "REPOSTA" ? "Reposta hoy" : d.senal === "ESPERA" ? "Espera unos días" : "Da igual") + ": gasolina 95 en Alicante";
-    pintarCabecera(d);
-    pintarVeredicto(d);
-    pintarPrecios(d);
-    pintarGrafico(d);
-    pintarMira(d);
+    // Formato antiguo (un solo combustible) o nuevo ({combustibles: {gasolina, diesel}})
+    if (d && !d.combustibles && d.precio) d = { actualizado: d.actualizado, zona: d.zona, combustibles: { gasolina: d } };
+    var claves = d && d.combustibles ? Object.keys(d.combustibles).filter(function (k) {
+      var c = d.combustibles[k]; return c && c.precio && typeof c.precio.media === "number";
+    }) : [];
+    if (!claves.length) { fallo("El archivo de datos no tiene el formato esperado."); return; }
+    DATOS = d;
+    var pedido = (location.hash || "").replace("#", "");
+    var guardado = null;
+    try { guardado = localStorage.getItem("combustible"); } catch (e) {}
+    ACTUAL = claves.indexOf(pedido) >= 0 ? pedido : claves.indexOf(guardado) >= 0 ? guardado : claves[0];
+    var sel = $("selector");
+    sel.textContent = "";
+    sel.hidden = claves.length < 2;
+    claves.forEach(function (k) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.dataset.clave = k;
+      b.textContent = NOMBRES[k] || k;
+      b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", function () { elegir(k); });
+      sel.appendChild(b);
+    });
+    pintarCombustible();
     $("estado").hidden = true;
     $("contenido").hidden = false;
   }
