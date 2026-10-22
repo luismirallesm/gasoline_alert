@@ -1,4 +1,4 @@
-"""Backtest del bot de gasolina 95 (provincia de Alicante).
+"""Backtest del bot de gasolina (provincia de Alicante).
 
 1. Baja del Ministerio el precio medio diario de los últimos DIAS días (y lo guarda en
    data/historico_ministerio.csv; las siguientes veces solo baja lo que falta).
@@ -29,28 +29,22 @@ VENTANA = 7                      # días que el conductor puede esperar como má
 URL = ("https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/"
        "EstacionesTerrestresHist/FiltroProvincia/{fecha}/{prov}")
 FORMATOS = ["%d-%m-%Y", "%Y-%m-%d"]   # el Ministerio no documenta el formato: probamos ambos
-COLS = ["fecha", "media", "mediana", "minimo", "n"]
+COLS = ["fecha", "media", "mediana", "minimo", "n", "media_d", "mediana_d", "minimo_d", "n_d"]  # _d = diésel
 
 
 # ---------- 1. Histórico del Ministerio ----------
 def valores_dia(d, fmt):
+    """Precios de ese día de gasolina 95 y diésel: {'gasolina': [...], 'diesel': [...]}."""
     r = gb.descargar(URL.format(fecha=d.strftime(fmt), prov=gb.PROVINCIA), intentos=3)
     est = json.loads(r.content.decode("utf-8-sig")).get("ListaEESSPrecio") or []
-    vals = []
-    for e in est:
-        txt = e.get("Precio Gasolina 95 E5") or e.get("Precio_x0020_Gasolina_x0020_95_x0020_E5") or ""
-        try:
-            vals.append(float(txt.replace(",", ".")))
-        except ValueError:
-            pass
-    return vals
+    return gb.valores_estaciones(est)
 
 
 def detectar_formato(d):
     errores = []
     for fmt in FORMATOS:
         try:
-            if len(valores_dia(d, fmt)) >= 50:
+            if len(valores_dia(d, fmt)["gasolina"]) >= 50:
                 print("Formato de fecha del Ministerio:", fmt)
                 return fmt
             errores.append(f"{fmt}: sin datos")
@@ -60,12 +54,30 @@ def detectar_formato(d):
                        "; ".join(errores) + ")")
 
 
+def fila_dia(d, vals):
+    f = {"fecha": d.isoformat()}
+    for suf, clave in (("", "gasolina"), ("_d", "diesel")):
+        v = vals[clave]
+        if v:
+            sr = pd.Series(v)
+            f.update({f"media{suf}": round(sr.mean(), 4), f"mediana{suf}": round(sr.median(), 4),
+                      f"minimo{suf}": sr.min(), f"n{suf}": len(sr)})
+        else:   # sin datos ese día: se anota n = 0 para no volver a pedirlo
+            f.update({f"media{suf}": np.nan, f"mediana{suf}": np.nan, f"minimo{suf}": np.nan, f"n{suf}": 0})
+    return f
+
+
 def descargar_historico(hoy):
     df = pd.read_csv(HIST) if HIST.exists() else pd.DataFrame(columns=COLS)
-    hechas = set(df["fecha"])
+    for c in COLS:
+        if c not in df:
+            df[c] = np.nan
+    # Un día está "hecho" si ya se pidió con las dos gasolinas (n_d anotado). Los días de versiones
+    # anteriores, que solo tenían gasolina 95, se vuelven a pedir una vez para completar el diésel.
+    hechas = set(df.loc[df["n_d"].notna(), "fecha"])
     pendientes = [hoy - timedelta(days=k) for k in range(DIAS, 0, -1)
                   if (hoy - timedelta(days=k)).isoformat() not in hechas]
-    print(f"Histórico: {len(hechas)} días ya guardados, {len(pendientes)} por descargar")
+    print(f"Histórico: {len(hechas)} días completos, {len(pendientes)} por descargar")
     if not pendientes:
         return df
     fmt = detectar_formato(pendientes[-1])
@@ -73,7 +85,7 @@ def descargar_historico(hoy):
 
     def volcar():
         out = pd.concat([df, pd.DataFrame(nuevas)], ignore_index=True)
-        out = out.drop_duplicates("fecha").sort_values("fecha")
+        out = out.drop_duplicates("fecha", keep="last").sort_values("fecha")
         HIST.parent.mkdir(exist_ok=True)
         out[COLS].to_csv(HIST, index=False)
         return out
@@ -89,13 +101,7 @@ def descargar_historico(hoy):
                 print("Demasiados fallos seguidos: sigo con lo descargado hasta ahora.")
                 break
             continue
-        if vals:
-            sr = pd.Series(vals)
-            nuevas.append({"fecha": d.isoformat(), "media": round(sr.mean(), 4),
-                           "mediana": round(sr.median(), 4), "minimo": sr.min(), "n": len(sr)})
-        else:
-            nuevas.append({"fecha": d.isoformat(), "media": np.nan, "mediana": np.nan,
-                           "minimo": np.nan, "n": 0})
+        nuevas.append(fila_dia(d, vals))
         if k % 25 == 24:
             volcar()
             print(f"  ...{k + 1}/{len(pendientes)}")
