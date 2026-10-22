@@ -14,6 +14,7 @@ import html
 import json
 import os
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,7 +38,13 @@ SUAVE = 0.75         # entre 0,75 y 1,5: solo se comenta la tendencia (DA IGUAL)
 # Umbrales en céntimos del modelo antiguo: ya no se usan en el aviso, backtest.py los sigue usando
 UMBRAL_SUBE = 0.7
 UMBRAL_BAJA = -1.0
-COLUMNAS = ["fecha", "media", "mediana", "minimo", "n", "senal", "exp_cts", "tono_z"]
+COLUMNAS = ["fecha", "media", "mediana", "minimo", "n", "senal", "exp_cts", "tono_z",
+            "media_d", "minimo_d", "n_d", "senal_d"]   # las terminadas en _d son del diésel
+COMBUSTIBLES = {
+    "gasolina": {"nombre": "Gasolina 95", "campo": "precio gasolina 95 e5", "ref": "rbob_eur_l", "mayorista": "Gasolina"},
+    "diesel": {"nombre": "Diésel", "campo": "precio gasoleo a", "ref": "gasoil_eur_l", "mayorista": "Gasóleo"},
+}
+NOTAS = {"diesel": "El aviso del diésel usa el mismo método que el de la gasolina y aún no se ha comprobado con datos históricos."}
 
 
 # ---------- Datos ----------
@@ -85,29 +92,49 @@ def descargar(url, intentos=6):
     raise ultimo
 
 
+def _norm(k):
+    k = k.replace("_x0020_", " ")
+    return "".join(c for c in unicodedata.normalize("NFD", k) if unicodedata.category(c) != "Mn").lower().strip()
+
+
+def valores_estaciones(estaciones):
+    """Precios de cada combustible en una lista de gasolineras (tolera tildes y nombres XML)."""
+    out = {k: [] for k in COMBUSTIBLES}
+    for e in estaciones:
+        ne = {_norm(k): v for k, v in e.items()}
+        for k, c in COMBUSTIBLES.items():
+            try:
+                out[k].append(float((ne.get(c["campo"]) or "").replace(",", ".")))
+            except ValueError:
+                pass
+    return out
+
+
 def precios_provincia():
     r = descargar(URL_MINETUR)
     estaciones = json.loads(r.content.decode("utf-8-sig"))["ListaEESSPrecio"]
-    valores = []
-    for e in estaciones:
-        txt = (e.get("Precio Gasolina 95 E5") or "").replace(",", ".")
-        try:
-            valores.append(float(txt))
-        except ValueError:
-            pass
-    s = pd.Series(valores)
-    if s.empty:
+    out = {}
+    for clave, v in valores_estaciones(estaciones).items():
+        if v:
+            sr = pd.Series(v)
+            out[clave] = {"media": sr.mean(), "mediana": sr.median(), "minimo": sr.min(), "n": len(sr)}
+        else:
+            out[clave] = None
+    if out["gasolina"] is None:
         raise RuntimeError("El Ministerio no devolvió precios de gasolina 95")
-    return {"media": s.mean(), "mediana": s.median(), "minimo": s.min(), "n": len(s)}
+    return out
 
 
 def mercado(periodo="1y"):
     import yfinance as yf
 
-    d = yf.download(["RB=F", "BZ=F", "EURUSD=X"], period=periodo, interval="1d",
-                    auto_adjust=True, progress=False)["Close"].dropna()
+    raw = yf.download(["RB=F", "BZ=F", "HO=F", "EURUSD=X"], period=periodo, interval="1d",
+                      auto_adjust=True, progress=False)["Close"]
+    d = raw[["RB=F", "BZ=F", "EURUSD=X"]].dropna()
     d["rbob_eur_l"] = d["RB=F"] / 3.78541 / d["EURUSD=X"]   # USD/galón -> EUR/litro
     d["brent_eur"] = d["BZ=F"] / d["EURUSD=X"]
+    if "HO=F" in raw:                                      # gasóleo de Nueva York: referencia del diésel
+        d["gasoil_eur_l"] = raw["HO=F"].reindex(d.index).ffill() / 3.78541 / d["EURUSD=X"]
     return d
 
 
@@ -170,8 +197,8 @@ def geopolitica():
 
 
 # ---------- Decisión ----------
-def decidir(mkt, tono_z, sesgo=None):
-    r = mkt["rbob_eur_l"]
+def decidir(mkt, tono_z, sesgo=None, ref="rbob_eur_l"):
+    r = mkt[ref].dropna()
     if len(r) < 40:
         raise RuntimeError("Pocos datos de mercado")
     nuevo = r.iloc[-3:].mean()                 # lo que cuesta ahora la gasolina mayorista
@@ -202,9 +229,11 @@ def decidir(mkt, tono_z, sesgo=None):
 
 # ---------- Histórico y acierto ----------
 def cargar():
-    if CSV.exists():
-        return pd.read_csv(CSV)
-    return pd.DataFrame(columns=COLUMNAS)
+    df = pd.read_csv(CSV) if CSV.exists() else pd.DataFrame(columns=COLUMNAS)
+    for c in COLUMNAS:
+        if c not in df:
+            df[c] = float("nan")   # archivos antiguos sin las columnas del diésel
+    return df
 
 
 def guardar(df, fila):
@@ -214,24 +243,24 @@ def guardar(df, fila):
     df[COLUMNAS].to_csv(CSV, index=False)
 
 
-def acierto(df):
+def acierto(df, med="media", sen="senal"):
     """Compara cada aviso con el precio real 7-9 días después. Si el precio no cambió, no cuenta."""
     d = df.copy()
     d["fecha"] = pd.to_datetime(d["fecha"])
     d = d.set_index("fecha").sort_index()
     ok = tot = 0
     for f, row in d.iterrows():
-        if row["senal"] not in ("REPOSTA", "ESPERA"):
+        if row[sen] not in ("REPOSTA", "ESPERA"):
             continue
         fut = d.loc[(d.index >= f + pd.Timedelta(days=7)) &
-                    (d.index <= f + pd.Timedelta(days=9)), "media"]
-        if fut.empty:
+                    (d.index <= f + pd.Timedelta(days=9)), med].dropna()
+        if fut.empty or pd.isna(row[med]):
             continue
-        dif = fut.iloc[0] - row["media"]
+        dif = fut.iloc[0] - row[med]
         if abs(dif) < 0.002:
             continue
         tot += 1
-        ok += (dif > 0) == (row["senal"] == "REPOSTA")
+        ok += (dif > 0) == (row[sen] == "REPOSTA")
     return ok, tot
 
 
@@ -277,37 +306,56 @@ def mensaje(p, dec, ok, tot, tendencia, aviso_precios=None, manana=None):
     return "\n".join(t)
 
 
-def publicar_web(p, dec, tendencia, dias=120):
-    """Escribe docs/datos.json: lo que muestra la web pública (GitHub Pages)."""
+def historia(clave, dias=120):
+    """Precio medio y mínimo diarios del combustible: histórico del Ministerio + registros propios del bot."""
+    sfx = "" if clave == "gasolina" else "_d"
+    ren = {f"media{sfx}": "media", f"minimo{sfx}": "minimo", f"senal{sfx}": "senal"}
     partes = []
     if HIST_MIN.exists():
-        partes.append(pd.read_csv(HIST_MIN)[["fecha", "media", "minimo"]])
+        h = pd.read_csv(HIST_MIN)
+        if f"media{sfx}" in h:
+            partes.append(h[["fecha", f"media{sfx}", f"minimo{sfx}"]].rename(columns=ren))
     propio = cargar()
     if len(propio):
-        partes.append(propio[["fecha", "media", "minimo", "senal"]])
-    hist = []
-    if partes:
-        df = pd.concat(partes, ignore_index=True).drop_duplicates("fecha", keep="last")
-        df["media"] = pd.to_numeric(df["media"], errors="coerce")
-        df["minimo"] = pd.to_numeric(df["minimo"], errors="coerce")
-        df = df.dropna(subset=["media"]).sort_values("fecha").tail(dias)
-        if "senal" not in df:
-            df["senal"] = None
-        for _, f in df.iterrows():
-            hist.append({"fecha": f["fecha"], "media": round(float(f["media"]), 3),
-                         "minimo": None if pd.isna(f["minimo"]) else round(float(f["minimo"]), 3),
-                         "senal": f["senal"] if isinstance(f["senal"], str) else None})
-    g = dec["ajuste_geo"]
-    datos = {
-        "actualizado": datetime.now(timezone.utc).isoformat(timespec="minutes"),
-        "zona": "provincia de Alicante", "combustible": "Gasolina 95",
-        "precio": {"media": round(p["media"], 3), "minimo": round(float(p["minimo"]), 3), "n": int(p["n"])},
-        "senal": dec["senal"], "mercado": dec["mercado"], "z": round(float(dec["z"]), 2),
-        "mayorista_pct": round(float(dec["cambio_may"]), 1), "brent_pct": round(float(dec["brent_7d"]), 1),
-        "noticias": "tension" if g > 0.2 else "calma" if g < -0.2 else "normal",
-        "semana_cts": None if tendencia is None else round(float(tendencia), 1),
-        "historico": hist,
-    }
+        partes.append(propio[["fecha", f"media{sfx}", f"minimo{sfx}", f"senal{sfx}"]].rename(columns=ren))
+    if not partes:
+        return []
+    df = pd.concat(partes, ignore_index=True).drop_duplicates("fecha", keep="last")
+    df["media"] = pd.to_numeric(df["media"], errors="coerce")
+    df["minimo"] = pd.to_numeric(df["minimo"], errors="coerce")
+    if "senal" not in df:
+        df["senal"] = None
+    df = df.dropna(subset=["media"]).sort_values("fecha").tail(dias)
+    return [{"fecha": f["fecha"], "media": round(float(f["media"]), 3),
+             "minimo": None if pd.isna(f["minimo"]) else round(float(f["minimo"]), 3),
+             "senal": f["senal"] if isinstance(f["senal"], str) else None} for _, f in df.iterrows()]
+
+
+def publicar_web(combustibles):
+    """Escribe docs/datos.json (lo que muestra la web pública). combustibles = {clave: (precios, decisión)}."""
+    hoy = pd.Timestamp.today().normalize()
+    out = {}
+    for clave, par in combustibles.items():
+        if not par:
+            continue
+        p, dec = par
+        hist = historia(clave)
+        previos = [r for r in hist if hoy - pd.Timestamp(r["fecha"]) >= pd.Timedelta(days=7)]
+        semana = None
+        if previos and (hoy - pd.Timestamp(previos[-1]["fecha"])).days <= 10:
+            semana = round((p["media"] - previos[-1]["media"]) * 100, 1)
+        g = dec["ajuste_geo"]
+        c = COMBUSTIBLES[clave]
+        out[clave] = {
+            "nombre": c["nombre"], "mayorista": c["mayorista"],
+            "precio": {"media": round(float(p["media"]), 3), "minimo": round(float(p["minimo"]), 3), "n": int(p["n"])},
+            "senal": dec["senal"], "mercado": dec["mercado"], "z": round(float(dec["z"]), 2),
+            "mayorista_pct": round(float(dec["cambio_may"]), 1), "brent_pct": round(float(dec["brent_7d"]), 1),
+            "noticias": "tension" if g > 0.2 else "calma" if g < -0.2 else "normal",
+            "semana_cts": semana, "nota": NOTAS.get(clave, ""), "historico": hist,
+        }
+    datos = {"actualizado": datetime.now(timezone.utc).isoformat(timespec="minutes"),
+             "zona": "provincia de Alicante", "combustibles": out}
     WEB.parent.mkdir(exist_ok=True)
     WEB.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
 
@@ -343,22 +391,34 @@ def main():
         return
     try:
         try:
-            p, aviso = paso("Precios del Ministerio", precios_provincia), None
+            p_all, aviso = paso("Precios del Ministerio", precios_provincia), None
         except Exception as e:
             if not ultimo:
                 print(f"{e}. Se reintentará en la próxima ejecución del día.")
                 return
-            p, aviso = None, e  # último intento: se avisa solo con el mercado
+            p_all, aviso = None, e  # último intento: se avisa solo con el mercado
+        p = p_all["gasolina"] if p_all else None
+        p_d = p_all.get("diesel") if p_all else None
         mkt = paso("Mercado (Yahoo Finance)", mercado)
         tono_z, sesgo = geopolitica()
         dec = decidir(mkt, tono_z, sesgo)
+        dec_d = None
+        if p_d:
+            try:
+                dec_d = decidir(mkt, tono_z, sesgo, ref="gasoil_eur_l")
+            except Exception as e:
+                print("Diésel no disponible:", repr(e))
         tendencia = None
         if p:
             if manana is None:  # una consulta a petición no pisa el dato de la mañana
-                guardar(df, {"fecha": hoy, "media": round(p["media"], 4),
-                             "mediana": round(p["mediana"], 4), "minimo": p["minimo"], "n": p["n"],
-                             "senal": dec["senal"], "exp_cts": round(dec["exp_cts"], 2),
-                             "tono_z": None if tono_z is None else round(tono_z, 2)})
+                fila = {"fecha": hoy, "media": round(p["media"], 4),
+                        "mediana": round(p["mediana"], 4), "minimo": p["minimo"], "n": p["n"],
+                        "senal": dec["senal"], "exp_cts": round(dec["exp_cts"], 2),
+                        "tono_z": None if tono_z is None else round(tono_z, 2)}
+                if p_d and dec_d:
+                    fila.update({"media_d": round(p_d["media"], 4), "minimo_d": p_d["minimo"],
+                                 "n_d": p_d["n"], "senal_d": dec_d["senal"]})
+                guardar(df, fila)
                 df = cargar()
             d = df.copy()
             d["fecha"] = pd.to_datetime(d["fecha"])
@@ -366,7 +426,7 @@ def main():
             tendencia = None if hace7.empty else (p["media"] - hace7.iloc[-1]["media"]) * 100
         if p:
             try:
-                publicar_web(p, dec, tendencia)
+                publicar_web({"gasolina": (p, dec), "diesel": (p_d, dec_d) if p_d and dec_d else None})
             except Exception as e:
                 print("No se pudo actualizar la web:", repr(e))
         ok, tot = acierto(df) if len(df) else (0, 0)
