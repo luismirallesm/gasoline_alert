@@ -30,6 +30,7 @@ URL_MINETUR = (
 CSV = Path("data/precios_alicante.csv")
 HIST_MIN = Path("data/historico_ministerio.csv")   # lo crea backtest.py
 WEB = Path("docs/datos.json")                       # lo lee docs/index.html
+WEB_EESS = Path("docs/gasolineras.json")            # gasolineras con coordenadas: buscador "cerca de ti"
 LITROS = 40          # tamaño de un repostaje típico
 IVA = 1.21
 PASO = 0.8           # fracción del cambio mayorista que acaba llegando al surtidor
@@ -110,9 +111,17 @@ def valores_estaciones(estaciones):
     return out
 
 
-def precios_provincia():
-    r = descargar(URL_MINETUR)
-    estaciones = json.loads(r.content.decode("utf-8-sig"))["ListaEESSPrecio"]
+def _num(v):
+    try:
+        return float((v or "").replace(",", "."))
+    except ValueError:
+        return None
+
+
+def precios_provincia(estaciones=None):
+    if estaciones is None:
+        r = descargar(URL_MINETUR)
+        estaciones = json.loads(r.content.decode("utf-8-sig"))["ListaEESSPrecio"]
     out = {}
     for clave, v in valores_estaciones(estaciones).items():
         if v:
@@ -360,6 +369,39 @@ def publicar_web(combustibles):
     WEB.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
 
 
+def publicar_gasolineras(estaciones):
+    """Escribe docs/gasolineras.json: cada gasolinera de venta al público con su dirección,
+    coordenadas y precios. La web lo usa para buscar la más barata cerca del usuario."""
+    lista = []
+    for e in estaciones:
+        ne = {_norm(k): v for k, v in e.items()}
+        if (ne.get("tipo venta") or "P").strip().upper() == "R":   # venta restringida (socios): no sirve a cualquiera
+            continue
+        lat, lon = _num(ne.get("latitud")), _num(ne.get("longitud (wgs84)"))
+        if lat is None or lon is None:
+            continue
+        precios = {k: _num(ne.get(c["campo"])) for k, c in COMBUSTIBLES.items()}
+        if not any(precios.values()):
+            continue
+        lista.append({
+            "id": ne.get("ideess", ""), "rotulo": (ne.get("rotulo") or "").strip(),
+            "direccion": (ne.get("direccion") or "").strip(), "localidad": (ne.get("localidad") or "").strip(),
+            "cp": (ne.get("c.p.") or "").strip(), "horario": (ne.get("horario") or "").strip(),
+            "lat": round(lat, 6), "lon": round(lon, 6),
+            **{k: v for k, v in precios.items() if v},
+        })
+    if not lista:
+        raise RuntimeError("ninguna gasolinera con coordenadas")
+    datos = {"actualizado": datetime.now(timezone.utc).isoformat(timespec="minutes"), "gasolineras": lista}
+    WEB_EESS.parent.mkdir(exist_ok=True)
+    WEB_EESS.write_text(json.dumps(datos, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+def descargar_estaciones():
+    r = descargar(URL_MINETUR)
+    return json.loads(r.content.decode("utf-8-sig"))["ListaEESSPrecio"]
+
+
 def enviar(texto):
     token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
@@ -391,12 +433,18 @@ def main():
         return
     try:
         try:
-            p_all, aviso = paso("Precios del Ministerio", precios_provincia), None
+            estaciones = paso("Precios del Ministerio", descargar_estaciones)
+            p_all, aviso = paso("Precios del Ministerio", lambda: precios_provincia(estaciones)), None
         except Exception as e:
             if not ultimo:
                 print(f"{e}. Se reintentará en la próxima ejecución del día.")
                 return
-            p_all, aviso = None, e  # último intento: se avisa solo con el mercado
+            estaciones, p_all, aviso = None, None, e  # último intento: se avisa solo con el mercado
+        if estaciones:
+            try:
+                publicar_gasolineras(estaciones)
+            except Exception as e:
+                print("No se pudo publicar la lista de gasolineras:", repr(e))
         p = p_all["gasolina"] if p_all else None
         p_d = p_all.get("diesel") if p_all else None
         mkt = paso("Mercado (Yahoo Finance)", mercado)
