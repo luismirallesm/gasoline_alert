@@ -148,6 +148,42 @@ footer { margin-top: 2.6rem; padding-top: 1.2rem; border-top: 1px solid var(--li
 footer p { max-width: none; }
 .estado { margin-top: 2rem; font-size: 1.1rem; }
 
+/* Gasolinera más barata cerca */
+.buscar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.7rem 0.9rem; margin: 0; }
+.buscar .o { color: var(--muted); padding-bottom: 0.55rem; }
+.buscar label { display: block; font-size: 0.88rem; color: var(--muted); margin-bottom: 0.2rem; }
+.buscar .cp { display: flex; }
+.buscar input {
+  font: inherit; width: 6.5rem; padding: 0.45rem 0.6rem; border: 1.5px solid var(--ink); border-right: 0;
+  border-radius: 0.5rem 0 0 0.5rem; background: transparent; color: var(--ink); font-variant-numeric: tabular-nums;
+}
+.buscar input:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.boton {
+  font: inherit; font-weight: 600; padding: 0.5rem 1rem; cursor: pointer; border-radius: 0.5rem;
+  border: 1.5px solid var(--ink); background: var(--ink); color: var(--bg);
+}
+.boton.sec { background: transparent; color: var(--ink); }
+.buscar .cp .boton { border-radius: 0 0.5rem 0.5rem 0; }
+.boton:disabled { opacity: 0.6; cursor: progress; }
+#cerca-estado { margin: 1rem 0 0; }
+#cerca-estado:empty { display: none; }
+.mejor { margin-top: 1rem; padding: 1rem 1.1rem; background: var(--go-tint); border-left: 4px solid var(--go); }
+.mejor .cab { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+.mejor .nombre { font-size: 1.2rem; font-weight: 700; }
+.mejor .precio { font-size: 1.5rem; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--go); }
+.mejor .precio small { font-size: 0.85rem; font-weight: 500; color: var(--muted); }
+.mejor p { margin: 0.35rem 0 0; }
+.mejor .meta { color: var(--muted); font-size: 0.92rem; }
+.mejor .ahorro { font-weight: 600; }
+.mejor a { display: inline-block; margin-top: 0.6rem; font-weight: 600; }
+ol.otras { margin: 1rem 0 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+ol.otras li { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; padding: 0.65rem 0; border-bottom: 1px solid var(--line); }
+ol.otras .q { min-width: 0; }
+ol.otras .q span { display: block; color: var(--muted); font-size: 0.88rem; overflow-wrap: anywhere; }
+ol.otras .p { font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+ol.otras .p small { display: block; font-weight: 500; color: var(--muted); font-size: 0.85rem; }
+h3.otras-t { font-size: 0.95rem; margin: 1.4rem 0 0; }
+
 @media (prefers-reduced-motion: reduce) { .medidor .marca { transition: none; } }
 </style>
 </head>
@@ -181,6 +217,24 @@ footer p { max-width: none; }
     <section aria-labelledby="h-precio">
       <h2 id="h-precio">Precio hoy</h2>
       <dl class="precios" id="precios"></dl>
+    </section>
+
+    <section aria-labelledby="h-cerca">
+      <h2 id="h-cerca">Gasolinera más barata cerca de ti</h2>
+      <p class="nota">Busca en un radio de 10 km. Si no hay ninguna, amplía la búsqueda hasta encontrarla. Solo gasolineras de la provincia de Alicante.</p>
+      <form class="buscar" id="buscar" novalidate>
+        <button type="button" class="boton sec" id="geo">Usar mi ubicación</button>
+        <span class="o">o</span>
+        <div>
+          <label for="cp">Código postal</label>
+          <div class="cp">
+            <input id="cp" name="cp" inputmode="numeric" autocomplete="postal-code" maxlength="5" placeholder="03001" aria-describedby="cerca-estado">
+            <button type="submit" class="boton">Buscar</button>
+          </div>
+        </div>
+      </form>
+      <p id="cerca-estado" role="status" aria-live="polite"></p>
+      <div id="cerca-res"></div>
     </section>
 
     <section aria-labelledby="h-grafico">
@@ -405,6 +459,7 @@ footer p { max-width: none; }
     pintarPrecios(c);
     pintarGrafico(c);
     pintarMira(c);
+    pintarCerca();
     var botones = $("selector").querySelectorAll("button");
     for (var i = 0; i < botones.length; i++) botones[i].setAttribute("aria-pressed", botones[i].dataset.clave === ACTUAL ? "true" : "false");
   }
@@ -445,6 +500,158 @@ footer p { max-width: none; }
     $("estado").hidden = true;
     $("contenido").hidden = false;
   }
+
+  // ---------- Gasolinera más barata cerca ----------
+  var RADIOS = [10, 15, 20, 30, 50, 80, 150];   // km: se amplía hasta encontrar alguna
+  var LITROS = 40;                                // repostaje típico (igual que el bot)
+  var EESS = null, ORIGEN = null;
+  var km1 = new Intl.NumberFormat("es-ES", { maximumFractionDigits: 1 });
+
+  function cargarEESS() {
+    if (EESS) return Promise.resolve(EESS);
+    return fetch("gasolineras.json?t=" + Date.now(), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        if (!d || !Array.isArray(d.gasolineras) || !d.gasolineras.length) throw new Error("formato");
+        EESS = d.gasolineras;
+        return EESS;
+      });
+  }
+
+  function distancia(a, b) { // km en línea recta (haversine)
+    var rad = Math.PI / 180, dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 12742 * Math.asin(Math.sqrt(h));
+  }
+
+  function capital(t) {
+    return String(t || "").toLowerCase().replace(/(^|[\s\/(\-])(\S)/g, function (m, a, b) { return a + b.toUpperCase(); });
+  }
+
+  function estadoCerca(msg) { $("cerca-estado").textContent = msg || ""; }
+
+  function ubicarCP(cp) {
+    // 1.º: centro de las gasolineras con ese código postal (sin salir de la web)
+    var mios = EESS.filter(function (e) { return e.cp === cp; });
+    if (mios.length) {
+      var lat = 0, lon = 0;
+      mios.forEach(function (e) { lat += e.lat; lon += e.lon; });
+      return Promise.resolve({ lat: lat / mios.length, lon: lon / mios.length });
+    }
+    // 2.º: códigos postales sin gasolinera, se buscan en OpenStreetMap
+    return fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=es&postalcode=" + cp)
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (l) {
+        if (!l || !l.length) return null;
+        return { lat: parseFloat(l[0].lat), lon: parseFloat(l[0].lon) };
+      });
+  }
+
+  function pintarCerca() {
+    var res = $("cerca-res");
+    res.textContent = "";
+    if (!ORIGEN || !EESS) return;
+    var clave = ACTUAL;
+    var nombre = (NOMBRES[clave] || clave).toLowerCase();
+    var con = EESS.filter(function (e) { return typeof e[clave] === "number"; })
+      .map(function (e) { return { e: e, km: distancia(ORIGEN, e) }; });
+    if (!con.length) { estadoCerca("No hay precios de " + nombre + " disponibles ahora mismo."); return; }
+    var radio = null, dentro = [];
+    for (var i = 0; i < RADIOS.length && !dentro.length; i++) {
+      radio = RADIOS[i];
+      dentro = con.filter(function (x) { return x.km <= radio; });
+    }
+    if (!dentro.length) {
+      estadoCerca("No hay ninguna gasolinera de la provincia de Alicante a menos de " + radio + " km " + ORIGEN.texto + ".");
+      return;
+    }
+    dentro.sort(function (a, b) { return a.e[clave] - b.e[clave] || a.km - b.km; });
+    var ampliado = radio > RADIOS[0];
+    estadoCerca((ampliado ? "No había ninguna a menos de " + RADIOS[0] + " km, así que se ha ampliado a " + radio + " km. " : "") +
+      dentro.length + (dentro.length === 1 ? " gasolinera" : " gasolineras") + " con " + nombre + " a menos de " + radio + " km " + ORIGEN.texto + ".");
+
+    var m = dentro[0], e = m.e;
+    var caja = document.createElement("div");
+    caja.className = "mejor";
+    function p(cls, txt) { var x = document.createElement("p"); if (cls) x.className = cls; x.textContent = txt; caja.appendChild(x); return x; }
+    var cab = document.createElement("div"); cab.className = "cab";
+    var n = document.createElement("span"); n.className = "nombre"; n.textContent = e.rotulo || "Gasolinera";
+    var pr = document.createElement("span"); pr.className = "precio"; pr.innerHTML = eur.format(e[clave]) + " <small>€/L</small>";
+    cab.appendChild(n); cab.appendChild(pr); caja.appendChild(cab);
+    p("", capital(e.direccion) + ", " + (e.cp ? e.cp + " " : "") + capital(e.localidad));
+    p("meta", "A " + km1.format(m.km) + " km en línea recta" + (e.horario ? " · Horario: " + e.horario : ""));
+    var c = DATOS && DATOS.combustibles[clave];
+    if (c && c.precio && typeof c.precio.media === "number" && c.precio.media > e[clave]) {
+      p("ahorro", "Unos " + eur2.format((c.precio.media - e[clave]) * LITROS) + " € menos que al precio medio de la provincia en un depósito de " + LITROS + " L.");
+    }
+    var a = document.createElement("a");
+    a.href = "https://www.google.com/maps/dir/?api=1&destination=" + e.lat + "," + e.lon;
+    a.target = "_blank"; a.rel = "noopener";
+    a.textContent = "Cómo llegar";
+    caja.appendChild(a);
+    res.appendChild(caja);
+
+    var resto = dentro.slice(1, 5);
+    if (resto.length) {
+      var h3 = document.createElement("h3"); h3.className = "otras-t"; h3.textContent = "Otras opciones en el radio";
+      var ol = document.createElement("ol"); ol.className = "otras";
+      resto.forEach(function (x) {
+        var li = document.createElement("li");
+        var q = document.createElement("div"); q.className = "q";
+        var l = document.createElement("a");
+        l.href = "https://www.google.com/maps/dir/?api=1&destination=" + x.e.lat + "," + x.e.lon;
+        l.target = "_blank"; l.rel = "noopener";
+        l.textContent = x.e.rotulo || "Gasolinera";
+        var s = document.createElement("span"); s.textContent = capital(x.e.direccion) + ", " + capital(x.e.localidad);
+        q.appendChild(l); q.appendChild(s);
+        var pp = document.createElement("div"); pp.className = "p";
+        pp.innerHTML = eur.format(x.e[clave]) + " €/L<small>" + km1.format(x.km) + " km</small>";
+        li.appendChild(q); li.appendChild(pp); ol.appendChild(li);
+      });
+      res.appendChild(h3); res.appendChild(ol);
+    }
+  }
+
+  function ocupado(si) {
+    var bs = $("buscar").querySelectorAll("button");
+    for (var i = 0; i < bs.length; i++) bs[i].disabled = si;
+  }
+
+  $("buscar").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var cp = $("cp").value.replace(/\s/g, "");
+    if (!/^\d{5}$/.test(cp)) { estadoCerca("Escribe un código postal de 5 cifras."); $("cerca-res").textContent = ""; return; }
+    if (cp.slice(0, 2) !== "03") { estadoCerca("Solo hay datos de la provincia de Alicante (códigos postales que empiezan por 03)."); $("cerca-res").textContent = ""; return; }
+    try { localStorage.setItem("cp", cp); } catch (e) {}
+    ocupado(true); estadoCerca("Buscando…");
+    cargarEESS()
+      .then(function () { return ubicarCP(cp); })
+      .then(function (o) {
+        if (!o) { estadoCerca("No se ha encontrado el código postal " + cp + "."); $("cerca-res").textContent = ""; return; }
+        o.texto = "del código postal " + cp; ORIGEN = o; pintarCerca();
+      })
+      .catch(function () { estadoCerca("No se pudo hacer la búsqueda. Vuelve a intentarlo en unos minutos."); })
+      .then(function () { ocupado(false); });
+  });
+
+  $("geo").addEventListener("click", function () {
+    if (!navigator.geolocation) { estadoCerca("Tu navegador no permite usar la ubicación. Escribe tu código postal."); return; }
+    ocupado(true); estadoCerca("Buscando tu ubicación…");
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      cargarEESS().then(function () {
+        ORIGEN = { lat: pos.coords.latitude, lon: pos.coords.longitude, texto: "de tu ubicación" };
+        pintarCerca();
+      }).catch(function () { estadoCerca("No se pudo cargar la lista de gasolineras. Vuelve a intentarlo en unos minutos."); })
+        .then(function () { ocupado(false); });
+    }, function (err) {
+      ocupado(false);
+      estadoCerca(err && err.code === 1 ? "No se ha dado permiso para usar la ubicación. Escribe tu código postal." :
+        "No se pudo obtener tu ubicación. Escribe tu código postal.");
+    }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 600000 });
+  });
+
+  try { var cpGuardado = localStorage.getItem("cp"); if (cpGuardado) $("cp").value = cpGuardado; } catch (e) {}
 
   fetch("datos.json?t=" + Date.now(), { cache: "no-store" })
     .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
