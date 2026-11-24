@@ -1,10 +1,10 @@
-"""Bot de Telegram: ¿repostar gasolina 95 hoy o esperar? (provincia de Alicante)
+"""Aviso diario: ¿repostar gasolina 95 hoy o esperar? (provincia de Alicante)
 
 Cada día:
   1. Baja los precios reales de todas las gasolineras de la provincia (API del Ministerio).
   2. Mide la gasolina mayorista (RBOB), el Brent y el EUR/USD (Yahoo Finance).
   3. Mide el tono de las noticias geopolíticas sobre petróleo (GDELT, gratis).
-  4. Decide REPOSTA / ESPERA / NEUTRO y lo manda por Telegram.
+  4. Decide REPOSTA / ESPERA / NEUTRO y lo publica en la web (docs/datos.json).
   5. Guarda el dato del día y, con el tiempo, mide su propio acierto real.
 
 Idea clave: el precio del surtidor tarda 1-2 semanas en copiar al mayorista. Si el
@@ -403,13 +403,8 @@ def descargar_estaciones():
 
 
 def enviar(texto):
-    token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        print(texto)  # modo prueba: sin Telegram, solo imprime
-        return
-    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat, "text": texto, "parse_mode": "HTML"}, timeout=30)
-    r.raise_for_status()
+    """Antes mandaba el aviso por Telegram. Ya no se envía nada: solo queda en el log."""
+    print(texto)
 
 
 def paso(nombre, fn):
@@ -420,15 +415,16 @@ def paso(nombre, fn):
 
 
 def main():
-    # El workflow lanza varios intentos al día. Solo el último (o una ejecución manual)
-    # avisa si no hay forma de leer los precios; los anteriores fallan en silencio y reintentan.
+    # El workflow lanza dos intentos al día: el de reserva solo trabaja si el primero no pudo,
+    # así que un día normal se consulta al Ministerio una sola vez. Solo el último intento
+    # (o una ejecución manual) avisa si no hay forma de leer los precios.
     ultimo = os.environ.get("ULTIMO_INTENTO", "true").lower() == "true"
     peticion = os.environ.get("PETICION", "false").lower() == "true"  # lanzado a mano o desde Telegram
     hoy = pd.Timestamp.today().strftime("%Y-%m-%d")
     df = cargar()
     fila_hoy = df[df["fecha"] == hoy]
     manana = fila_hoy.iloc[0] if (peticion and not fila_hoy.empty) else None
-    if not ultimo and (df["fecha"] == hoy).any():
+    if not peticion and not fila_hoy.empty:
         print("Ya se envió el aviso de hoy; nada que hacer.")
         return
     try:
