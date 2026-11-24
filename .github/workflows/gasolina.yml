@@ -1,10 +1,12 @@
 name: gasolina
 on:
   schedule:
-    - cron: "30 6 * * *"    # 1.er intento (~08:30 España)
-    - cron: "30 8 * * *"    # 2.º intento, solo actúa si el 1.º no pudo
-    - cron: "30 10 * * *"   # 3.er y último intento: si falla, avisa solo con el mercado
+    - cron: "30 6 * * *"    # intento principal (~07:30-08:30 España): una sola consulta al Ministerio
+    - cron: "30 10 * * *"   # reserva: solo actúa si el principal no pudo; si falla, avisa solo con el mercado
   workflow_dispatch:         # lanzarlo a mano para probar
+concurrency:                 # GitHub a veces retrasa horas los cron: que nunca corran dos a la vez
+  group: gasolina
+  cancel-in-progress: false
 permissions:
   contents: write
 jobs:
@@ -19,8 +21,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python gasolina_bot.py
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PETICION: ${{ github.event_name == 'workflow_dispatch' }}
           ULTIMO_INTENTO: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '30 10 * * *' }}
       - name: Guardar histórico
